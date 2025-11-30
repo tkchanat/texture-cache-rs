@@ -1,4 +1,8 @@
-use std::io::{Read, Write};
+use std::{
+    io::{Read, Write},
+    marker::PhantomData,
+    os::unix::fs::FileExt,
+};
 
 const MAGIC_BYTES: [u8; 4] = [0x54, 0x49, 0x4C, 0x45]; // "TILE"
 
@@ -20,6 +24,14 @@ macro_rules! impl_power_of_two {
                     true => Ok(Self(value)),
                     false => Err(()),
                 }
+            }
+        }
+
+        impl std::ops::Deref for PowerOfTwo<$ty> {
+            type Target = $ty;
+
+            fn deref(&self) -> &Self::Target {
+                &self.0
             }
         }
     };
@@ -71,6 +83,26 @@ impl PixelFormat {
     }
 }
 
+#[derive(Debug, PartialEq)]
+pub struct Luma<T>(T);
+#[derive(Debug, PartialEq)]
+pub struct Rgb<T>([T; 3]);
+#[derive(Debug, PartialEq)]
+pub struct Rgba<T>([T; 4]);
+
+pub trait Texel {
+    const STRIDE: usize;
+}
+impl<T> Texel for Luma<T> {
+    const STRIDE: usize = size_of::<T>();
+}
+impl<T> Texel for Rgb<T> {
+    const STRIDE: usize = size_of::<T>() * 3;
+}
+impl<T> Texel for Rgba<T> {
+    const STRIDE: usize = size_of::<T>() * 4;
+}
+
 pub enum WrapMode {
     Clamp,
     Repeat,
@@ -78,7 +110,7 @@ pub enum WrapMode {
 }
 
 #[repr(C)]
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Extent {
     width: u32,
     height: u32,
@@ -87,6 +119,74 @@ pub struct Extent {
 impl Extent {
     pub fn new(width: u32, height: u32) -> Self {
         Extent { width, height }
+    }
+}
+
+// Within a tile, texels are laid out in scanline order.
+#[derive(Debug, PartialEq)]
+pub struct Tile<'a> {
+    scanlines: Vec<&'a [u8]>,
+}
+
+// An iterator over a byte slice in (non-overlapping) chunks, starting at the beginning of the slice.
+pub struct Tiles<'a> {
+    // source data descriptors
+    data: &'a [u8],
+    width: u32,
+    height: u32,
+    scanline_stride: usize,
+    // tile descriptors
+    tile_size: u32,
+    texel_stride: usize,
+    // iterator state
+    x_begin: u32,
+    y_begin: u32,
+}
+
+impl<'a> Tiles<'a> {
+    pub fn new<T: Texel>(data: &'a [u8], width: u32, height: u32, tile_size: u32) -> Self {
+        Self {
+            data,
+            width,
+            height,
+            scanline_stride: width as usize * T::STRIDE,
+            tile_size,
+            texel_stride: T::STRIDE,
+            x_begin: 0,
+            y_begin: 0,
+        }
+    }
+}
+
+// Within a level, tiles are laid out left-to-right, top-to-bottom.
+impl<'a> Iterator for Tiles<'a> {
+    type Item = Tile<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.x_begin >= self.width {
+            self.x_begin = 0;
+            self.y_begin += self.tile_size;
+        }
+        if self.y_begin >= self.height {
+            return None;
+        }
+        let scanlines = (0..self.tile_size)
+            .filter_map(|scanline| {
+                let y = self.y_begin + scanline;
+                if y >= self.height {
+                    None
+                } else {
+                    let start = y as usize * self.scanline_stride
+                        + self.x_begin as usize * self.texel_stride;
+                    let end = start
+                        + self.tile_size.min(self.width - self.x_begin) as usize
+                            * self.texel_stride;
+                    Some(&self.data[start..end])
+                }
+            })
+            .collect::<Vec<_>>();
+        self.x_begin += self.tile_size;
+        Some(Tile { scanlines })
     }
 }
 
@@ -198,6 +298,7 @@ pub struct TiledImage {
     first_in_memory_level: u32,
     level_resolution: Vec<Extent>,
     level_offset: Vec<usize>,
+    in_memory_levels: Vec<Box<[u8]>>,
 }
 
 impl TiledImage {
@@ -207,17 +308,31 @@ impl TiledImage {
     pub fn open<P: AsRef<std::path::Path>>(path: P) -> Result<Self, std::io::Error> {
         let mut file = std::fs::File::open(path.as_ref())?;
         let header = Header::read(&mut file)?;
+        let pixel_format = PixelFormat::from_u32(header.format);
+        let mip_levels = header.level_offset.len();
+        let first_in_memory_level = header.first_in_memory_level;
+        let level_resolution = header.level_resolution;
+        let mut in_memory_levels = Vec::with_capacity(mip_levels);
+        for level in first_in_memory_level as usize..mip_levels {
+            let Extent { width, height } = level_resolution[level];
+            let offset = header.level_offset[level];
+            let mut buf = vec![0u8; (width * height) as usize * pixel_format.texel_bytes()];
+            file.read_exact_at(&mut buf, offset)?;
+            in_memory_levels.push(buf.into_boxed_slice());
+        }
+        assert!(in_memory_levels.len() == mip_levels - first_in_memory_level as usize);
         Ok(Self {
             file,
-            pixel_format: PixelFormat::from_u32(header.format),
+            pixel_format,
             log_tile_size: header.log_tile_size,
-            first_in_memory_level: header.first_in_memory_level,
-            level_resolution: header.level_resolution,
+            first_in_memory_level,
+            level_resolution,
             level_offset: header
                 .level_offset
                 .into_iter()
                 .map(|o| o as usize)
                 .collect(),
+            in_memory_levels,
         })
     }
 
@@ -264,11 +379,43 @@ impl TiledImage {
             log_tile_size: tile_size.ilog2(),
             format: format as u32,
             first_in_memory_level,
-            level_resolution,
+            level_resolution: level_resolution.clone(),
             level_offset,
         };
-        // eprintln!("Header: {header:?}");
+
+        // Write header
         header.write(writer)?;
+
+        // Write in-header levels
+        for data in in_header_levels {
+            writer.write(data)?;
+        }
+
+        // Write tiled data
+        for (i, data) in in_memory_levels.iter().enumerate() {
+            let level = first_in_memory_level as usize - i;
+            let Extent { width, height } = level_resolution[level];
+            // eprintln!(
+            //     "writing tiled data for level {}, in {}x{}",
+            //     level, width, height
+            // );
+            let tiles = match format {
+                PixelFormat::Y8 => Tiles::new::<Luma<u8>>(&data, width, height, *tile_size as u32),
+                PixelFormat::RGB8 => Tiles::new::<Rgb<u8>>(&data, width, height, *tile_size as u32),
+                _ => todo!(),
+            };
+            for tile in tiles {
+                for scanline in tile.scanlines {
+                    writer.write(scanline)?;
+                    // pad the tile
+                    let padding = *tile_size as usize * format.texel_bytes() - scanline.len();
+                    if padding != 0 {
+                        writer.write(&vec![0u8; padding])?;
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -391,13 +538,96 @@ impl TiledImage {
             (self.level_resolution[level as usize].width + tile_width - 1) / self.log_tile_size;
         self.level_offset[level as usize] + self.tile_disk_bytes() * (y * x_tiles + x) as usize
     }
+
+    pub fn get_texel(&self, x: u32, y: u32, level: u32) -> Option<&[u8]> {
+        if level < self.first_in_memory_level {
+            return None;
+        }
+        let level_start = &self.in_memory_levels[(level - self.first_in_memory_level) as usize];
+        let width = self.level_resolution[level as usize].width;
+        let start = (y * width + x) as usize * self.pixel_format.texel_bytes();
+        let end = start + self.pixel_format.texel_bytes();
+        Some(&level_start[start..end])
+    }
+
+    // to be removed
+    pub fn get_level(&self, level: u32) -> Option<Vec<u8>> {
+        let Extent { width, height } = self.level_resolution[level as usize];
+        let mut buf = vec![0u8; (width * height) as usize * self.pixel_format.texel_bytes()];
+        let offset = self.level_offset[level as usize];
+        self.file.read_exact_at(&mut buf, offset as u64).ok()?;
+        Some(buf)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use std::io::Seek;
 
-    use super::*;
+    #[test]
+    fn test_tile_iterator() {
+        #[rustfmt::skip]
+        let data: [u8; 16] = [
+            0, 1, 2, 3,
+            4, 5, 6, 7,
+            8, 9, 10, 11,
+            12, 13, 14, 15
+        ];
+        let mut iter = Tiles::new::<Luma<u8>>(&data, 4, 4, 2);
+        assert_eq!(
+            Some(Tile {
+                scanlines: vec![&[0, 1], &[4, 5]],
+            }),
+            iter.next()
+        );
+        assert_eq!(
+            Some(Tile {
+                scanlines: vec![&[2, 3], &[6, 7]],
+            }),
+            iter.next()
+        );
+        assert_eq!(
+            Some(Tile {
+                scanlines: vec![&[8, 9], &[12, 13]],
+            }),
+            iter.next()
+        );
+        assert_eq!(
+            Some(Tile {
+                scanlines: vec![&[10, 11], &[14, 15]],
+            }),
+            iter.next()
+        );
+        assert_eq!(None, iter.next());
+
+        let mut iter = Tiles::new::<Luma<u8>>(&data, 4, 4, 3);
+        assert_eq!(
+            Some(Tile {
+                scanlines: vec![&[0, 1, 2], &[4, 5, 6], &[8, 9, 10]],
+            }),
+            iter.next()
+        );
+        assert_eq!(
+            Some(Tile {
+                scanlines: vec![&[3], &[7], &[11]],
+            }),
+            iter.next()
+        );
+        assert_eq!(
+            Some(Tile {
+                scanlines: vec![&[12, 13, 14]],
+            }),
+            iter.next()
+        );
+        assert_eq!(
+            Some(Tile {
+                scanlines: vec![&[15]],
+            }),
+            iter.next()
+        );
+        assert_eq!(None, iter.next());
+    }
 
     #[test]
     fn test_header_roundtrip() {

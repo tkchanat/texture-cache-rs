@@ -11,6 +11,9 @@ path = "src/maketiled.rs"
 crate-type = ["lib"]
 
 [dependencies]
+bytemuck = "1.24.0"
+crossbeam-epoch = "0.9.18"
+crossbeam-utils = "0.8.21"
 
 [dev-dependencies]
 image = "0.25.9"

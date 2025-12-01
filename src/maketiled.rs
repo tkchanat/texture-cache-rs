@@ -4,7 +4,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use image::{EncodableLayout as _, ImageBuffer, Pixel, Rgb};
+    use image::{EncodableLayout as _, ImageBuffer, Rgb};
     use std::fs::File;
     use texture_cache_rs::*;
 
@@ -14,7 +14,7 @@ mod tests {
         assert_eq!(1024, checker.width());
         assert_eq!(1024, checker.height());
         let rgb8 = checker.into_rgb8();
-        let format = PixelFormat::RGB8;
+        let format = PixelFormat::Rgb8;
         let tile_size = PowerOfTwo::try_from(64).unwrap();
         let file_path = "assets/checker.txp";
         let mut out_file = File::create(file_path).expect("Unable to create output file");

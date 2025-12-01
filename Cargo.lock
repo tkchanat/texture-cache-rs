@@ -878,6 +878,9 @@ dependencies = [
 name = "texture-cache-rs"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
+ "crossbeam-epoch",
+ "crossbeam-utils",
  "image",
  "tempfile",
 ]

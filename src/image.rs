@@ -1,6 +1,6 @@
+use crate::texel::*;
 use std::{
     io::{Read, Write},
-    marker::PhantomData,
     os::unix::fs::FileExt,
 };
 
@@ -41,67 +41,6 @@ impl_power_of_two!(u16);
 impl_power_of_two!(u32);
 impl_power_of_two!(u64);
 impl_power_of_two!(usize);
-
-#[repr(u32)]
-#[derive(Debug, Copy, Clone)]
-pub enum PixelFormat {
-    SY8,
-    Y8,
-    RGB8,
-    SRGB8,
-    Y16,
-    RGB16,
-    Y32,
-    RGB32,
-}
-
-impl PixelFormat {
-    // Returns the total number of bytes that a single texel in the given format uses.
-    pub const fn texel_bytes(&self) -> usize {
-        match self {
-            PixelFormat::SY8 | PixelFormat::Y8 => 1,
-            PixelFormat::Y16 => 2,
-            PixelFormat::RGB8 | PixelFormat::SRGB8 => 3,
-            PixelFormat::Y32 => 4,
-            PixelFormat::RGB16 => 6,
-            PixelFormat::RGB32 => 12,
-        }
-    }
-
-    pub fn from_u32(value: u32) -> Self {
-        match value {
-            0 => PixelFormat::SY8,
-            1 => PixelFormat::Y8,
-            2 => PixelFormat::RGB8,
-            3 => PixelFormat::SRGB8,
-            4 => PixelFormat::Y16,
-            5 => PixelFormat::RGB16,
-            6 => PixelFormat::Y32,
-            7 => PixelFormat::RGB32,
-            _ => panic!("Invalid pixel format"),
-        }
-    }
-}
-
-#[derive(Debug, PartialEq)]
-pub struct Luma<T>(T);
-#[derive(Debug, PartialEq)]
-pub struct Rgb<T>([T; 3]);
-#[derive(Debug, PartialEq)]
-pub struct Rgba<T>([T; 4]);
-
-pub trait Texel {
-    const STRIDE: usize;
-}
-impl<T> Texel for Luma<T> {
-    const STRIDE: usize = size_of::<T>();
-}
-impl<T> Texel for Rgb<T> {
-    const STRIDE: usize = size_of::<T>() * 3;
-}
-impl<T> Texel for Rgba<T> {
-    const STRIDE: usize = size_of::<T>() * 4;
-}
 
 pub enum WrapMode {
     Clamp,
@@ -292,8 +231,9 @@ impl Header {
 }
 
 pub struct TiledImage {
+    pub path: std::ffi::OsString,
+    pub format: PixelFormat,
     file: std::fs::File,
-    pixel_format: PixelFormat,
     log_tile_size: u32,
     first_in_memory_level: u32,
     level_resolution: Vec<Extent>,
@@ -322,8 +262,9 @@ impl TiledImage {
         }
         assert!(in_memory_levels.len() == mip_levels - first_in_memory_level as usize);
         Ok(Self {
+            path: path.as_ref().as_os_str().to_owned(),
             file,
-            pixel_format,
+            format: pixel_format,
             log_tile_size: header.log_tile_size,
             first_in_memory_level,
             level_resolution,
@@ -400,8 +341,13 @@ impl TiledImage {
             //     level, width, height
             // );
             let tiles = match format {
-                PixelFormat::Y8 => Tiles::new::<Luma<u8>>(&data, width, height, *tile_size as u32),
-                PixelFormat::RGB8 => Tiles::new::<Rgb<u8>>(&data, width, height, *tile_size as u32),
+                PixelFormat::Luma8 => {
+                    Tiles::new::<Luma<u8>>(&data, width, height, *tile_size as u32)
+                }
+                PixelFormat::Rgb8 => Tiles::new::<Rgb<u8>>(&data, width, height, *tile_size as u32),
+                PixelFormat::Rgba8 => {
+                    Tiles::new::<Rgba<u8>>(&data, width, height, *tile_size as u32)
+                }
                 _ => todo!(),
             };
             for tile in tiles {
@@ -508,7 +454,7 @@ impl TiledImage {
 
     // Returns the total number of bytes needed to store all of the texels in a single tile of the texture.
     pub fn tile_bytes(&self) -> usize {
-        (1 << self.log_tile_size) * (1 << self.log_tile_size) * self.pixel_format.texel_bytes()
+        (1 << self.log_tile_size) * (1 << self.log_tile_size) * self.format.texel_bytes()
     }
 
     // Returns the number of bytes that each texture tile uses on disk, accounting for memory alignment.
@@ -524,19 +470,20 @@ impl TiledImage {
     }
 
     // Given a pixel coordinate (x, y), return the offset of the corresponding tile.
-    pub fn tile_offset(&self, x: u32, y: u32) -> usize {
+    pub fn texel_offset(&self, x: u32, y: u32) -> usize {
         let tile_mask = (1 << self.log_tile_size) - 1;
         let tilep = (x & tile_mask, y & tile_mask);
         let tile_width = 1 << self.log_tile_size;
-        self.pixel_format.texel_bytes() * (tilep.1 * tile_width + tilep.0) as usize
+        self.format.texel_bytes() * (tilep.1 * tile_width + tilep.0) as usize
     }
 
     // Returns the offset in the file where the tile at coordinates (x, y) at a given level starts.
-    pub fn file_offset(&self, x: u32, y: u32, level: u32) -> usize {
+    pub fn file_offset(&self, tile_x: u32, tile_y: u32, level: u32) -> usize {
         let tile_width = 1 << self.log_tile_size;
         let x_tiles =
             (self.level_resolution[level as usize].width + tile_width - 1) / self.log_tile_size;
-        self.level_offset[level as usize] + self.tile_disk_bytes() * (y * x_tiles + x) as usize
+        self.level_offset[level as usize]
+            + self.tile_disk_bytes() * (tile_y * x_tiles + tile_x) as usize
     }
 
     pub fn get_texel(&self, x: u32, y: u32, level: u32) -> Option<&[u8]> {
@@ -545,15 +492,15 @@ impl TiledImage {
         }
         let level_start = &self.in_memory_levels[(level - self.first_in_memory_level) as usize];
         let width = self.level_resolution[level as usize].width;
-        let start = (y * width + x) as usize * self.pixel_format.texel_bytes();
-        let end = start + self.pixel_format.texel_bytes();
+        let start = (y * width + x) as usize * self.format.texel_bytes();
+        let end = start + self.format.texel_bytes();
         Some(&level_start[start..end])
     }
 
     // to be removed
     pub fn get_level(&self, level: u32) -> Option<Vec<u8>> {
         let Extent { width, height } = self.level_resolution[level as usize];
-        let mut buf = vec![0u8; (width * height) as usize * self.pixel_format.texel_bytes()];
+        let mut buf = vec![0u8; (width * height) as usize * self.format.texel_bytes()];
         let offset = self.level_offset[level as usize];
         self.file.read_exact_at(&mut buf, offset as u64).ok()?;
         Some(buf)
@@ -637,7 +584,7 @@ mod tests {
                 magic: MAGIC_BYTES,
                 version: 1,
                 log_tile_size: 32,
-                format: PixelFormat::RGB8 as u32,
+                format: PixelFormat::Rgb8 as u32,
                 first_in_memory_level: 4,
                 level_resolution: vec![
                     Extent::new(1024, 768),
@@ -662,7 +609,7 @@ mod tests {
             assert_eq!(header.magic, MAGIC_BYTES);
             assert_eq!(header.version, 1);
             assert_eq!(header.log_tile_size, 32);
-            assert_eq!(header.format, PixelFormat::RGB8 as u32);
+            assert_eq!(header.format, PixelFormat::Rgb8 as u32);
             assert_eq!(
                 header.level_resolution,
                 vec![

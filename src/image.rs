@@ -480,10 +480,10 @@ impl TiledImage {
     // Returns the offset in the file where the tile at coordinates (x, y) at a given level starts.
     pub fn file_offset(&self, tile_x: u32, tile_y: u32, level: u32) -> usize {
         let tile_width = 1 << self.log_tile_size;
-        let x_tiles =
-            (self.level_resolution[level as usize].width + tile_width - 1) / self.log_tile_size;
-        self.level_offset[level as usize]
-            + self.tile_disk_bytes() * (tile_y * x_tiles + tile_x) as usize
+        let base_offset = self.level_offset[level as usize];
+        let width = self.level_resolution[level as usize].width;
+        let x_tiles = (width + tile_width - 1) >> self.log_tile_size;
+        base_offset + self.tile_disk_bytes() * (tile_y * x_tiles + tile_x) as usize
     }
 
     pub fn get_texel(&self, x: u32, y: u32, level: u32) -> Option<&[u8]> {

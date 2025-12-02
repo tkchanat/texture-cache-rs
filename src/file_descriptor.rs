@@ -1,4 +1,4 @@
-use std::{collections::HashMap, ffi::OsStr, sync::Mutex};
+use std::{collections::HashMap, ffi::OsStr};
 
 pub struct FdEntry {
     file: std::fs::File,
@@ -53,7 +53,8 @@ impl FdCache {
     }
 
     pub fn recycle(&mut self, entry: FdEntry) {
-        self.free_list.push(entry.index);
-        self.files[entry.index].insert(entry);
+        let index = entry.index;
+        self.free_list.push(index);
+        self.files[index] = Some(entry);
     }
 }

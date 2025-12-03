@@ -882,6 +882,7 @@ dependencies = [
  "crossbeam-epoch",
  "crossbeam-utils",
  "image",
+ "rayon",
  "tempfile",
 ]
 

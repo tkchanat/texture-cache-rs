@@ -7,6 +7,7 @@ use hash_table::{TextureTile, TileHashTable};
 pub use image::{PowerOfTwo, TiledImage, WrapMode};
 use std::{
     io::{Read, Seek},
+    ops::Range,
     pin::Pin,
     sync::{Condvar, Mutex, atomic::Ordering},
 };
@@ -41,11 +42,10 @@ impl TextureCache {
             Pin::new(vec![0u8; n_tiles * Self::TILE_ALLOC_SIZE].into_boxed_slice());
 
         // Allocate TextureTiles and initialize free list
-        let mut _all_tiles_alloc = _tile_mem_alloc
-            .chunks_exact_mut(Self::TILE_ALLOC_SIZE)
-            .map(|chunk| TextureTile {
+        let mut _all_tiles_alloc = (0..n_tiles)
+            .map(|i| TextureTile {
                 tile_id: TileId::default(),
-                texels: chunk.as_mut_ptr_range(),
+                texels: i * Self::TILE_ALLOC_SIZE..(i + 1) * Self::TILE_ALLOC_SIZE,
                 marked: Default::default(),
             })
             .collect::<Box<_>>();
@@ -99,11 +99,10 @@ impl TextureCache {
         // get texel pointer from cache and return value
         let (tile_x, tile_y) = tex.tile_index(x, y);
         let tile_id = TileId::new(tex_id, level, tile_x, tile_y);
-        let tile_ptr = self.get_tile(tile_id);
-        let texel_offset = tex.texel_offset(x, y);
-        let texel = unsafe { tile_ptr.add(texel_offset) };
-        let bytes = unsafe { std::slice::from_raw_parts(texel, tex.format.texel_bytes()) };
-        T::from_bytes(&bytes[0..T::STRIDE])
+        let tile = self.get_tile(tile_id);
+        let texel_offset = tile.start + tex.texel_offset(x, y);
+        let texel = &self._tile_mem_alloc[texel_offset..texel_offset + tex.format.texel_bytes()];
+        T::from_bytes(&texel[0..T::STRIDE])
     }
 
     fn read_tile(&self, tile_id: TileId, tile: &mut TextureTile) {
@@ -114,13 +113,17 @@ impl TextureCache {
         let mut fd_cache = self.fd_cache.lock().unwrap();
         let mut fd_entry = fd_cache.look_up(tile_id.tex_id(), &tex.path);
         let tile_bytes = tex.tile_bytes();
-        let buf = unsafe { std::slice::from_raw_parts_mut(tile.texels.start, tile_bytes) };
         fd_entry
             .seek(std::io::SeekFrom::Start(offset as u64))
             .expect("Invalid offset into tile");
+        let buf = unsafe {
+            std::slice::from_raw_parts_mut(
+                self._tile_mem_alloc.as_ptr().add(tile.texels.start) as *mut u8,
+                tile_bytes,
+            )
+        };
         let mut total_bytes_read = 0;
-        let mut max_try = 0;
-        while total_bytes_read < tile_bytes && max_try < 16 {
+        while total_bytes_read < tile_bytes {
             let bytes_read = fd_entry
                 .read(&mut buf[total_bytes_read..])
                 .expect("Error while reading tile");
@@ -128,22 +131,20 @@ impl TextureCache {
             fd_entry
                 .seek(std::io::SeekFrom::Current(bytes_read as i64))
                 .expect("Invalid offset into tile");
-            max_try += 1;
         }
-        // assert_eq!(total_bytes_read, tile_bytes);
+        assert_eq!(total_bytes_read, tile_bytes);
         // read texel data and return file descriptor
         fd_cache.recycle(fd_entry);
     }
 
     // Returns a pointer to the start of the texels for the given texture tile.
-    fn get_tile(&self, tile_id: TileId) -> *const u8 {
+    fn get_tile(&self, tile_id: TileId) -> Range<usize> {
         // return tile if it's present in the hash table
         let guard = crossbeam_epoch::pin();
         let table = unsafe { self.hash_table.load(Ordering::Acquire, &guard).deref() };
         if let Some(bytes) = table.look_up(tile_id) {
-            return bytes;
+            return bytes.clone();
         }
-        std::mem::drop(guard);
         // check to see if another thread is already loading this tile
         let mut outstanding_reads = self.outstanding_reads.lock().unwrap();
         for read_tile_id in outstanding_reads.iter() {
@@ -173,7 +174,7 @@ impl TextureCache {
         }
         std::mem::drop(outstanding_reads);
         self.outstanding_reads_condvar.notify_all();
-        tile.texels.start
+        tile.texels.clone()
     }
 
     // Returns an available tile, freeing tiles if needed.
@@ -232,8 +233,6 @@ mod tests {
         let tex_id = cache
             .add_texture("assets/checker.txp")
             .expect("Failed to add texture");
-        // let _: texel::Rgb<u8> = cache.texel(tex_id, 0, 128, 0);
-        // assert!(false);
 
         let mut out: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(1024, 1024);
         let level = 0;

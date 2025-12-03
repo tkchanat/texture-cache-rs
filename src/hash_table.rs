@@ -63,7 +63,7 @@ impl std::fmt::Debug for TileId {
 #[derive(Debug)]
 pub struct TextureTile {
     pub(crate) tile_id: TileId,
-    pub(crate) texels: Range<*mut u8>,
+    pub(crate) texels: Range<usize>,
     pub(crate) marked: AtomicBool,
 }
 
@@ -112,7 +112,7 @@ impl TileHashTable {
         }
     }
 
-    pub fn look_up(&self, tile_id: TileId) -> Option<*const u8> {
+    pub fn look_up(&self, tile_id: TileId) -> Option<Range<usize>> {
         let mut hash_offset = tile_id.hash().rem_euclid(self.size);
         let mut step = 1;
         loop {
@@ -125,7 +125,7 @@ impl TileHashTable {
                         if entry.marked.load(Ordering::Relaxed) {
                             entry.marked.store(false, Ordering::Relaxed);
                         }
-                        return Some(entry.texels.start);
+                        return Some(entry.texels.clone());
                     }
                     // resolve hash collision
                     hash_offset += step * step;

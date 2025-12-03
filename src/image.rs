@@ -6,6 +6,7 @@ use std::{
 
 const MAGIC_BYTES: [u8; 4] = [0x54, 0x49, 0x4C, 0x45]; // "TILE"
 
+#[derive(Copy, Clone, Debug)]
 pub struct PowerOfTwo<T>(T);
 
 macro_rules! impl_power_of_two {
@@ -84,6 +85,7 @@ pub struct Tiles<'a> {
 
 impl<'a> Tiles<'a> {
     pub fn new<T: Texel>(data: &'a [u8], width: u32, height: u32, tile_size: u32) -> Self {
+        assert_eq!((width * height) as usize * T::STRIDE, data.len());
         Self {
             data,
             width,
@@ -120,11 +122,14 @@ impl<'a> Iterator for Tiles<'a> {
                     let end = start
                         + self.tile_size.min(self.width - self.x_begin) as usize
                             * self.texel_stride;
+                    debug_assert!((end - start) <= self.tile_size as usize * self.texel_stride);
                     Some(&self.data[start..end])
                 }
             })
             .collect::<Vec<_>>();
         self.x_begin += self.tile_size;
+        debug_assert!(self.x_begin.is_multiple_of(self.tile_size));
+        debug_assert!(self.y_begin.is_multiple_of(self.tile_size));
         Some(Tile { scanlines })
     }
 }
@@ -244,6 +249,7 @@ pub struct TiledImage {
 impl TiledImage {
     const TILE_DISK_ALIGNMENT: usize = 4096;
     const TOP_LEVELS_BYTES: usize = 3800;
+    const ZERO_BUF: [u8; 4096] = [0u8; 4096];
 
     pub fn open<P: AsRef<std::path::Path>>(path: P) -> Result<Self, std::io::Error> {
         let mut file = std::fs::File::open(path.as_ref())?;
@@ -271,7 +277,7 @@ impl TiledImage {
             level_offset: header
                 .level_offset
                 .into_iter()
-                .map(|o| o as usize)
+                .map(|x| x as usize)
                 .collect(),
             in_memory_levels,
         })
@@ -288,6 +294,7 @@ impl TiledImage {
         assert!(!levels.is_empty());
         assert!(levels.len() == level_resolution.len());
 
+        // Partition which levels are stored in header, and the rest goes to disk.
         let mut acc = 0;
         let mut first_in_memory_level = 0;
         levels.reverse();
@@ -298,30 +305,52 @@ impl TiledImage {
                 break;
             }
         }
+        let (in_header_levels, in_file_levels) = levels.split_at(first_in_memory_level as usize);
 
+        // Calculate in header level offsets
         let mip_levels = levels.len();
-        let header_offset = Header::byte_size(mip_levels) as u64;
-        // eprintln!("Header offset: {}", header_offset);
+        let header_offset = Header::byte_size(mip_levels);
         let mut level_offset = vec![0; mip_levels];
         let mut offset = header_offset;
-        for (i, data) in levels.iter().enumerate() {
+        for (i, data) in in_header_levels.iter().enumerate() {
             let level = mip_levels - i - 1;
             level_offset[level] = offset;
-            offset += data.len() as u64;
-            // eprintln!("Level {} offset: {}", level, level_offset[level]);
+            offset += data.len();
+            eprintln!(
+                "In header offset for level {}: {}",
+                level, level_offset[level]
+            );
         }
+        let in_file_alignment_pad = offset.next_multiple_of(Self::TILE_DISK_ALIGNMENT) - offset;
+        offset += in_file_alignment_pad;
 
-        let in_memory_levels = levels.split_off(first_in_memory_level as usize);
-        let in_header_levels = &levels[0..first_in_memory_level as usize];
+        // Calculate in file level offsets
+        let log_tile_size = tile_size.ilog2();
+        let tile_scanline_bytes = *tile_size as usize * format.texel_bytes();
+        let tile_bytes = *tile_size as usize * tile_scanline_bytes;
+        let aligned_tile_bytes = tile_bytes.next_multiple_of(Self::TILE_DISK_ALIGNMENT);
+        for i in 0..in_file_levels.len() {
+            let level = mip_levels - first_in_memory_level as usize - i - 1;
+            let Extent { width, height } = level_resolution[level];
+            let x_tiles = (width + *tile_size - 1) >> log_tile_size;
+            let y_tiles = (height + *tile_size - 1) >> log_tile_size;
+            level_offset[level] = offset;
+            offset += aligned_tile_bytes * (x_tiles * y_tiles) as usize;
+            eprintln!(
+                "In file offset for level {}: {}",
+                level, level_offset[level]
+            );
+        }
+        eprintln!("File size: {offset:?}");
 
         let header = Header {
             magic: MAGIC_BYTES,
             version: 0,
-            log_tile_size: tile_size.ilog2(),
+            log_tile_size,
             format: format as u32,
             first_in_memory_level,
             level_resolution: level_resolution.clone(),
-            level_offset,
+            level_offset: level_offset.into_iter().map(|x| x as u64).collect(),
         };
 
         // Write header
@@ -329,36 +358,37 @@ impl TiledImage {
 
         // Write in-header levels
         for data in in_header_levels {
-            writer.write(data)?;
+            writer.write_all(data)?;
         }
+        writer.write_all(&Self::ZERO_BUF[0..in_file_alignment_pad])?;
 
         // Write tiled data
-        for (i, data) in in_memory_levels.iter().enumerate() {
-            let level = first_in_memory_level as usize - i;
+        let alignment_pad_size = aligned_tile_bytes - tile_bytes;
+        for (i, data) in in_file_levels.iter().enumerate() {
+            // writer.write_all(data)?;
+            // continue;
+            let level = mip_levels - first_in_memory_level as usize - i - 1;
             let Extent { width, height } = level_resolution[level];
-            // eprintln!(
-            //     "writing tiled data for level {}, in {}x{}",
-            //     level, width, height
-            // );
             let tiles = match format {
-                PixelFormat::Luma8 => {
-                    Tiles::new::<Luma<u8>>(&data, width, height, *tile_size as u32)
-                }
-                PixelFormat::Rgb8 => Tiles::new::<Rgb<u8>>(&data, width, height, *tile_size as u32),
-                PixelFormat::Rgba8 => {
-                    Tiles::new::<Rgba<u8>>(&data, width, height, *tile_size as u32)
-                }
+                PixelFormat::Luma8 => Tiles::new::<Luma<u8>>(data, width, height, *tile_size),
+                PixelFormat::Rgb8 => Tiles::new::<Rgb<u8>>(data, width, height, *tile_size),
+                PixelFormat::Rgba8 => Tiles::new::<Rgba<u8>>(data, width, height, *tile_size),
                 _ => todo!(),
             };
             for tile in tiles {
+                let remaining_scanlines = *tile_size as usize - tile.scanlines.len();
                 for scanline in tile.scanlines {
-                    writer.write(scanline)?;
-                    // pad the tile
-                    let padding = *tile_size as usize * format.texel_bytes() - scanline.len();
-                    if padding != 0 {
-                        writer.write(&vec![0u8; padding])?;
-                    }
+                    // write scanline data
+                    writer.write_all(scanline)?;
+                    // pad the scanline
+                    let scanline_pad_size = tile_scanline_bytes - scanline.len();
+                    writer.write_all(&Self::ZERO_BUF[0..scanline_pad_size])?;
                 }
+                for _ in 0..remaining_scanlines {
+                    writer.write_all(&Self::ZERO_BUF[0..tile_scanline_bytes])?;
+                }
+                // pad the tile to fulfill TILE_DISK_ALIGNMENT
+                writer.write_all(&Self::ZERO_BUF[0..alignment_pad_size])?;
             }
         }
 
@@ -452,14 +482,23 @@ impl TiledImage {
         Self::create(levels, level_resolution, format, tile_size, writer)
     }
 
+    // If the texel for the given coordinate is available from the top few
+    // pyramid levels that are stored in the file's header and were loaded,
+    // this returns a pointer to it.
+    pub fn get_texel(&self, x: u32, y: u32, level: u32) -> Option<&[u8]> {
+        if level < self.first_in_memory_level {
+            return None;
+        }
+        let level_start = &self.in_memory_levels[(level - self.first_in_memory_level) as usize];
+        let width = self.level_resolution[level as usize].width;
+        let start = (y * width + x) as usize * self.format.texel_bytes();
+        let end = start + self.format.texel_bytes();
+        Some(&level_start[start..end])
+    }
+
     // Returns the total number of bytes needed to store all of the texels in a single tile of the texture.
     pub fn tile_bytes(&self) -> usize {
         (1 << self.log_tile_size) * (1 << self.log_tile_size) * self.format.texel_bytes()
-    }
-
-    // Returns the number of bytes that each texture tile uses on disk, accounting for memory alignment.
-    pub fn tile_disk_bytes(&self) -> usize {
-        (self.tile_bytes() + Self::TILE_DISK_ALIGNMENT - 1) & !(Self::TILE_DISK_ALIGNMENT - 1)
     }
 
     // Given a pixel coordinate (x, y), return the coordinates for the tile containing the pixel.
@@ -486,23 +525,17 @@ impl TiledImage {
         base_offset + self.tile_disk_bytes() * (tile_y * x_tiles + tile_x) as usize
     }
 
-    pub fn get_texel(&self, x: u32, y: u32, level: u32) -> Option<&[u8]> {
-        if level < self.first_in_memory_level {
-            return None;
-        }
-        let level_start = &self.in_memory_levels[(level - self.first_in_memory_level) as usize];
-        let width = self.level_resolution[level as usize].width;
-        let start = (y * width + x) as usize * self.format.texel_bytes();
-        let end = start + self.format.texel_bytes();
-        Some(&level_start[start..end])
+    // Returns the number of bytes that each texture tile uses on disk, accounting for memory alignment.
+    fn tile_disk_bytes(&self) -> usize {
+        (self.tile_bytes() + Self::TILE_DISK_ALIGNMENT - 1) & !(Self::TILE_DISK_ALIGNMENT - 1)
     }
 
     // to be removed
     pub fn get_level(&self, level: u32) -> Option<Vec<u8>> {
         let Extent { width, height } = self.level_resolution[level as usize];
         let mut buf = vec![0u8; (width * height) as usize * self.format.texel_bytes()];
-        let offset = self.level_offset[level as usize];
-        self.file.read_exact_at(&mut buf, offset as u64).ok()?;
+        let offset = self.file_offset(0, 0, level);
+        self.file.read_at(&mut buf, offset as u64).ok()?;
         Some(buf)
     }
 }

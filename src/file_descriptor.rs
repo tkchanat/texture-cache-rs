@@ -14,6 +14,12 @@ impl std::ops::Deref for FdEntry {
     }
 }
 
+impl std::ops::DerefMut for FdEntry {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.file
+    }
+}
+
 pub struct FdCache {
     files: Box<[Option<FdEntry>]>,
     free_list: Vec<usize>,

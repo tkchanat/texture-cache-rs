@@ -6,7 +6,7 @@ mod texel;
 use hash_table::{TextureTile, TileHashTable};
 pub use image::{PowerOfTwo, TiledImage, WrapMode};
 use std::{
-    os::unix::fs::FileExt,
+    io::{Read, Seek},
     pin::Pin,
     sync::{Condvar, Mutex, atomic::Ordering},
 };
@@ -28,6 +28,7 @@ pub struct TextureCache {
 }
 
 impl TextureCache {
+    // Just enough to store 64x64 texels for the common 3-channel RGB, 8-bit texture format.
     const TILE_ALLOC_SIZE: usize = 3 * 64 * 64;
     const MAX_OPENED_FILES: usize = 1024;
 
@@ -98,8 +99,9 @@ impl TextureCache {
         // get texel pointer from cache and return value
         let (tile_x, tile_y) = tex.tile_index(x, y);
         let tile_id = TileId::new(tex_id, level, tile_x, tile_y);
+        let tile_ptr = self.get_tile(tile_id);
         let texel_offset = tex.texel_offset(x, y);
-        let texel = unsafe { self.get_tile(tile_id).add(texel_offset) };
+        let texel = unsafe { tile_ptr.add(texel_offset) };
         let bytes = unsafe { std::slice::from_raw_parts(texel, tex.format.texel_bytes()) };
         T::from_bytes(&bytes[0..T::STRIDE])
     }
@@ -110,18 +112,25 @@ impl TextureCache {
         // get file descriptor and seek to start of texture tile
         let offset = tex.file_offset(tile_id.tile_x(), tile_id.tile_y(), tile_id.level());
         let mut fd_cache = self.fd_cache.lock().unwrap();
-        let fd_entry = fd_cache.look_up(tile_id.tex_id(), &tex.path);
+        let mut fd_entry = fd_cache.look_up(tile_id.tex_id(), &tex.path);
         let tile_bytes = tex.tile_bytes();
-        assert!(
-            !tile.texels.is_empty(),
-            "Texel cannot be null at tile ({},{})",
-            tile_id.tile_x(),
-            tile_id.tile_y()
-        );
         let buf = unsafe { std::slice::from_raw_parts_mut(tile.texels.start, tile_bytes) };
         fd_entry
-            .read_exact_at(buf, offset as u64)
-            .expect("Read error while read_tile");
+            .seek(std::io::SeekFrom::Start(offset as u64))
+            .expect("Invalid offset into tile");
+        let mut total_bytes_read = 0;
+        let mut max_try = 0;
+        while total_bytes_read < tile_bytes && max_try < 16 {
+            let bytes_read = fd_entry
+                .read(&mut buf[total_bytes_read..])
+                .expect("Error while reading tile");
+            total_bytes_read += bytes_read;
+            fd_entry
+                .seek(std::io::SeekFrom::Current(bytes_read as i64))
+                .expect("Invalid offset into tile");
+            max_try += 1;
+        }
+        // assert_eq!(total_bytes_read, tile_bytes);
         // read texel data and return file descriptor
         fd_cache.recycle(fd_entry);
     }
@@ -223,6 +232,8 @@ mod tests {
         let tex_id = cache
             .add_texture("assets/checker.txp")
             .expect("Failed to add texture");
+        // let _: texel::Rgb<u8> = cache.texel(tex_id, 0, 128, 0);
+        // assert!(false);
 
         let mut out: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(1024, 1024);
         let level = 0;

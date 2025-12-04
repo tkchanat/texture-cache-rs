@@ -62,13 +62,14 @@ impl std::fmt::Debug for TileId {
 
 #[derive(Debug)]
 pub struct TextureTile {
+    pub(crate) index: usize,
     pub(crate) tile_id: TileId,
     pub(crate) texels: Range<usize>,
     pub(crate) marked: AtomicBool,
 }
 
 pub struct TileHashTable {
-    size: u64,
+    size: usize,
     table: Box<[AtomicPtr<TextureTile>]>,
     hash_entry_copied: Vec<bool>,
 }
@@ -78,14 +79,14 @@ impl TileHashTable {
 
     pub fn new(size: usize) -> Self {
         Self {
-            size: size as u64,
+            size,
             table: (0..size).map(|_| AtomicPtr::default()).collect::<Box<_>>(),
             hash_entry_copied: vec![false; size],
         }
     }
 
     pub fn insert(&self, tile: &mut TextureTile) {
-        let mut hash_offset = tile.tile_id.hash().rem_euclid(self.size);
+        let mut hash_offset = tile.tile_id.hash() % self.size as u64;
         let mut step = 1;
         let mut current = Self::NULL;
         loop {
@@ -102,8 +103,8 @@ impl TileHashTable {
                     if ptr != Self::NULL {
                         hash_offset += step * step;
                         step += 1;
-                        if hash_offset >= self.size {
-                            hash_offset &= self.size;
+                        if hash_offset >= self.size as u64 {
+                            hash_offset %= self.size as u64;
                         }
                     }
                     current = ptr;
@@ -113,7 +114,7 @@ impl TileHashTable {
     }
 
     pub fn look_up(&self, tile_id: TileId) -> Option<Range<usize>> {
-        let mut hash_offset = tile_id.hash().rem_euclid(self.size);
+        let mut hash_offset = tile_id.hash() % self.size as u64;
         let mut step = 1;
         loop {
             match self.table[hash_offset as usize].load(Ordering::Acquire) {
@@ -130,8 +131,8 @@ impl TileHashTable {
                     // resolve hash collision
                     hash_offset += step * step;
                     step += 1;
-                    if hash_offset >= self.size {
-                        hash_offset %= self.size;
+                    if hash_offset >= self.size as u64 {
+                        hash_offset %= self.size as u64;
                     }
                 }
             }
@@ -155,33 +156,37 @@ impl TileHashTable {
         let mut n_copied = 0;
         let mut n_active = 0;
         // insert unmarked entries from hash table to dest
-        for i in 0..self.size as usize {
+        for i in 0..self.size {
             self.hash_entry_copied[i] = false;
-            let entry = self.table[i].load(Ordering::Acquire);
-            if entry.is_null() {
-                continue;
-            }
-            let entry = unsafe { &mut *entry };
-            // add entry to dest if unmarked
+            let entry = match self.table[i].load(Ordering::Acquire) {
+                Self::NULL => continue,
+                ptr => unsafe { &mut *ptr },
+            };
             n_active += 1;
+            // add entry to dest if unmarked
             if !entry.marked.load(Ordering::Relaxed) {
                 self.hash_entry_copied[i] = true;
                 n_copied += 1;
                 dest.insert(entry);
             }
         }
-        eprintln!("Copied {}/{} tiles during free_tiles", n_copied, n_active);
-        // TODO: handle case of all entries copied to free_hash_table
+        // eprintln!("Copied {}/{} tiles during free_tiles", n_copied, n_active);
+        // handle case of all entries copied to free_hash_table
+        if n_copied == n_active {
+            for i in 0..self.size / 2 {
+                self.hash_entry_copied[i] = false;
+            }
+        }
     }
 
-    pub fn reclaim_uncopied(&self, returned: &mut Vec<*mut TextureTile>) {
-        for i in 0..self.size as usize {
-            let entry = self.table[i].load(Ordering::Acquire);
-            if entry.is_null() {
-                continue;
-            }
+    pub fn reclaim_uncopied(&self, returned: &mut Vec<usize>) {
+        for i in 0..self.size {
+            let entry = match self.table[i].load(Ordering::Acquire) {
+                Self::NULL => continue,
+                ptr => unsafe { &mut *ptr },
+            };
             if !self.hash_entry_copied[i] {
-                returned.push(entry);
+                returned.push(entry.index);
             }
             self.table[i].store(Self::NULL, Ordering::Relaxed);
         }

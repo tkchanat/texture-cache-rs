@@ -8,7 +8,6 @@ pub use image::{PowerOfTwo, TiledImage, WrapMode};
 use std::{
     io::{Read, Seek},
     ops::Range,
-    pin::Pin,
     sync::{Condvar, Mutex, atomic::Ordering},
 };
 pub use texel::PixelFormat;
@@ -16,9 +15,9 @@ pub use texel::PixelFormat;
 use crate::{file_descriptor::FdCache, hash_table::TileId, texel::Texel};
 
 pub struct TextureCache {
-    _tile_mem_alloc: Pin<Box<[u8]>>,
+    _tile_mem_alloc: Box<[u8]>,
     _all_tiles_alloc: Box<[TextureTile]>,
-    free_tiles: Mutex<Vec<*mut TextureTile>>,
+    free_tiles: Mutex<Vec<usize>>,
     hash_table: crossbeam_epoch::Atomic<TileHashTable>,
     free_hash_table: crossbeam_epoch::Atomic<TileHashTable>,
     textures: Vec<TiledImage>,
@@ -38,23 +37,18 @@ impl TextureCache {
         let n_tiles = max_texture_bytes / Self::TILE_ALLOC_SIZE;
 
         // Allocate tile memory for texture cache
-        let mut _tile_mem_alloc =
-            Pin::new(vec![0u8; n_tiles * Self::TILE_ALLOC_SIZE].into_boxed_slice());
+        let mut _tile_mem_alloc = vec![0u8; n_tiles * Self::TILE_ALLOC_SIZE].into_boxed_slice();
 
         // Allocate TextureTiles and initialize free list
         let mut _all_tiles_alloc = (0..n_tiles)
             .map(|i| TextureTile {
+                index: i,
                 tile_id: TileId::default(),
                 texels: i * Self::TILE_ALLOC_SIZE..(i + 1) * Self::TILE_ALLOC_SIZE,
                 marked: Default::default(),
             })
             .collect::<Box<_>>();
-        let free_tiles = Mutex::new(
-            _all_tiles_alloc
-                .iter_mut()
-                .map(|tile| -> *mut TextureTile { tile })
-                .collect::<Vec<_>>(),
-        );
+        let free_tiles = Mutex::new((0..n_tiles).collect::<Vec<_>>());
         let hash_size = 8 * n_tiles;
         let mark_free_capacity = 1 + n_tiles / 8;
 
@@ -150,10 +144,11 @@ impl TextureCache {
         for read_tile_id in outstanding_reads.iter() {
             if *read_tile_id == tile_id {
                 // wait for tile_id to be read before retrying lookup
-                let _guard = self
+                let outstanding_reads = self
                     .outstanding_reads_condvar
                     .wait(outstanding_reads)
                     .unwrap();
+                std::mem::drop(outstanding_reads);
                 return self.get_tile(tile_id);
             }
         }
@@ -181,7 +176,7 @@ impl TextureCache {
     fn get_free_tile(&self) -> &mut TextureTile {
         let mut free_tiles = self.free_tiles.lock().unwrap();
         if free_tiles.is_empty() {
-            // copy unmarked tileds to free_hash_table
+            // copy unmarked tiles to free_hash_table
             let guard = crossbeam_epoch::pin();
             let hash_table = unsafe { self.hash_table.load(Ordering::Relaxed, &guard).deref_mut() };
             let mut free_hash_table = self.free_hash_table.load(Ordering::Relaxed, &guard);
@@ -199,6 +194,7 @@ impl TextureCache {
                 hash_table.mark_entries();
             }
         }
+        assert!(!free_tiles.is_empty());
         // mark hash table entries if free-tile availability is low
         if free_tiles.len() == self.mark_free_capacity {
             let guard = crossbeam_epoch::pin();
@@ -206,10 +202,14 @@ impl TextureCache {
             hash_table.mark_entries();
         }
         // return tile from free_tiles
-        let tile = unsafe { &mut *free_tiles.pop().unwrap() };
-        assert!(!tile.texels.is_empty());
-        tile.tile_id = TileId::default();
-        tile
+        unsafe {
+            self._all_tiles_alloc
+                .as_ptr()
+                .add(free_tiles.pop().unwrap())
+                .cast_mut()
+                .as_mut()
+                .unwrap()
+        }
     }
 }
 
@@ -217,15 +217,7 @@ impl TextureCache {
 mod tests {
     use super::*;
     use ::image::{ImageBuffer, ImageFormat, Rgb};
-
-    #[test]
-    fn test_pinned_mem() {
-        let mut mem = Pin::new(Box::new([0u8; 6]));
-        let base_ptr = mem.as_mut_ptr();
-        let slice = unsafe { std::slice::from_raw_parts_mut(base_ptr, 3) };
-        slice.copy_from_slice(&[1u8, 2u8, 3u8]);
-        assert_eq!(&[1u8, 2u8, 3u8, 0u8, 0u8, 0u8], mem.as_slice());
-    }
+    use rayon::iter::ParallelIterator;
 
     #[test]
     fn test_texture_cache() {
@@ -236,13 +228,11 @@ mod tests {
 
         let mut out: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(1024, 1024);
         let level = 0;
-        for y in 0..1024 {
-            for x in 0..1024 {
-                let texel: texel::Rgb<u8> = cache.texel(tex_id, level, x, y);
-                let pixel = &mut out.get_pixel_mut(x, y).0;
-                *pixel = texel.as_ref().clone();
-            }
-        }
+        out.par_enumerate_pixels_mut().for_each(|(x, y, pixel)| {
+            let texel: texel::Rgb<u8> = cache.texel(tex_id, level, x, y);
+            let pixel = &mut pixel.0;
+            *pixel = texel.as_ref().clone();
+        });
         let mut out_file = std::fs::File::create("assets/test.png").unwrap();
         out.write_to(&mut out_file, ImageFormat::Png).unwrap();
     }

@@ -4,7 +4,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use image::{EncodableLayout as _, ImageBuffer, Rgb};
+    use image::EncodableLayout as _;
     use std::fs::File;
     use texture_cache_rs::*;
 
@@ -30,13 +30,5 @@ mod tests {
             )
             .is_ok()
         );
-
-        let image = TiledImage::open(file_path).expect("Unable to open test image");
-        let bytes = image.get_level(0).expect("Cannot get level 0");
-        let out: ImageBuffer<Rgb<u8>, Vec<u8>> =
-            image::ImageBuffer::from_raw(1024, 1024, bytes).unwrap();
-        let mut out_file = File::create("assets/test.png").unwrap();
-        out.write_to(&mut out_file, image::ImageFormat::Png)
-            .unwrap();
     }
 }

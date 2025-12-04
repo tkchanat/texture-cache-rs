@@ -238,7 +238,6 @@ impl Header {
 pub struct TiledImage {
     pub path: std::ffi::OsString,
     pub format: PixelFormat,
-    file: std::fs::File,
     log_tile_size: u32,
     first_in_memory_level: u32,
     level_resolution: Vec<Extent>,
@@ -269,7 +268,6 @@ impl TiledImage {
         assert!(in_memory_levels.len() == mip_levels - first_in_memory_level as usize);
         Ok(Self {
             path: path.as_ref().as_os_str().to_owned(),
-            file,
             format: pixel_format,
             log_tile_size: header.log_tile_size,
             first_in_memory_level,
@@ -528,15 +526,6 @@ impl TiledImage {
     // Returns the number of bytes that each texture tile uses on disk, accounting for memory alignment.
     fn tile_disk_bytes(&self) -> usize {
         (self.tile_bytes() + Self::TILE_DISK_ALIGNMENT - 1) & !(Self::TILE_DISK_ALIGNMENT - 1)
-    }
-
-    // to be removed
-    pub fn get_level(&self, level: u32) -> Option<Vec<u8>> {
-        let Extent { width, height } = self.level_resolution[level as usize];
-        let mut buf = vec![0u8; (width * height) as usize * self.format.texel_bytes()];
-        let offset = self.file_offset(0, 0, level);
-        self.file.read_at(&mut buf, offset as u64).ok()?;
-        Some(buf)
     }
 }
 

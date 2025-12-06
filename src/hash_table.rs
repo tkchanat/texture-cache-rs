@@ -1,7 +1,4 @@
-use std::{
-    ops::Range,
-    sync::atomic::{AtomicBool, AtomicPtr, Ordering},
-};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 #[derive(Copy, Clone, Default, PartialEq)]
 pub struct TileId(u64);
@@ -64,7 +61,7 @@ impl std::fmt::Debug for TileId {
 pub struct TextureTile {
     pub(crate) index: usize,
     pub(crate) tile_id: TileId,
-    pub(crate) texels: Range<usize>,
+    pub(crate) offset: usize,
     pub(crate) marked: AtomicBool,
 }
 
@@ -113,7 +110,7 @@ impl TileHashTable {
         }
     }
 
-    pub fn look_up(&self, tile_id: TileId) -> Option<Range<usize>> {
+    pub fn look_up(&self, tile_id: TileId) -> Option<usize> {
         let mut hash_offset = tile_id.hash() % self.size as u64;
         let mut step = 1;
         loop {
@@ -126,7 +123,7 @@ impl TileHashTable {
                         if entry.marked.load(Ordering::Relaxed) {
                             entry.marked.store(false, Ordering::Relaxed);
                         }
-                        return Some(entry.texels.clone());
+                        return Some(entry.offset);
                     }
                     // resolve hash collision
                     hash_offset += step * step;
@@ -152,31 +149,26 @@ impl TileHashTable {
     }
 
     // Copies a subset of the tiles to the new hash table, leaving a number of others to be freed.
-    pub fn copy_active(&mut self, dest: &mut TileHashTable) {
-        let mut n_copied = 0;
-        let mut n_active = 0;
+    pub fn copy_active(&mut self, dest: &TileHashTable) {
+        // let mut n_copied = 0;
+        // let mut n_active = 0;
         // insert unmarked entries from hash table to dest
         for i in 0..self.size {
             self.hash_entry_copied[i] = false;
             let entry = match self.table[i].load(Ordering::Acquire) {
                 Self::NULL => continue,
-                ptr => unsafe { &mut *ptr },
+                ptr => unsafe { ptr.as_mut().unwrap() },
             };
-            n_active += 1;
+            // n_active += 1;
             // add entry to dest if unmarked
             if !entry.marked.load(Ordering::Relaxed) {
                 self.hash_entry_copied[i] = true;
-                n_copied += 1;
+                // n_copied += 1;
                 dest.insert(entry);
             }
         }
         // eprintln!("Copied {}/{} tiles during free_tiles", n_copied, n_active);
         // handle case of all entries copied to free_hash_table
-        if n_copied == n_active {
-            for i in 0..self.size / 2 {
-                self.hash_entry_copied[i] = false;
-            }
-        }
     }
 
     pub fn reclaim_uncopied(&self, returned: &mut Vec<usize>) {

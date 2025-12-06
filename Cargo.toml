@@ -12,10 +12,14 @@ crate-type = ["lib"]
 
 [dependencies]
 bytemuck = "1.24.0"
-crossbeam-epoch = "0.9.18"
-crossbeam-utils = "0.8.21"
+seize = "0.5.1"
 
 [dev-dependencies]
+criterion = "0.8.0"
 image = "0.25.9"
 tempfile = "3.23.0"
 rayon = "1.11.0"
+
+[[bench]]
+name = "benchmark"
+harness = false

@@ -5,12 +5,15 @@ mod texel;
 
 use hash_table::{TextureTile, TileHashTable};
 pub use image::{PowerOfTwo, TiledImage, WrapMode};
+use seize::Guard;
 use std::{
     io::{Read, Seek},
-    ops::Range,
-    sync::{Condvar, Mutex, atomic::Ordering},
+    sync::{
+        Condvar, Mutex,
+        atomic::{AtomicPtr, Ordering},
+    },
 };
-pub use texel::PixelFormat;
+pub use texel::{Luma, PixelFormat, Rgb, Rgba};
 
 use crate::{file_descriptor::FdCache, hash_table::TileId, texel::Texel};
 
@@ -18,8 +21,9 @@ pub struct TextureCache {
     _tile_mem_alloc: Box<[u8]>,
     _all_tiles_alloc: Box<[TextureTile]>,
     free_tiles: Mutex<Vec<usize>>,
-    hash_table: crossbeam_epoch::Atomic<TileHashTable>,
-    free_hash_table: crossbeam_epoch::Atomic<TileHashTable>,
+    rcu_collector: seize::Collector,
+    hash_table: AtomicPtr<TileHashTable>,
+    free_hash_table: AtomicPtr<TileHashTable>,
     textures: Vec<TiledImage>,
     outstanding_reads: Mutex<Vec<TileId>>,
     outstanding_reads_condvar: Condvar,
@@ -44,7 +48,7 @@ impl TextureCache {
             .map(|i| TextureTile {
                 index: i,
                 tile_id: TileId::default(),
-                texels: i * Self::TILE_ALLOC_SIZE..(i + 1) * Self::TILE_ALLOC_SIZE,
+                offset: i * Self::TILE_ALLOC_SIZE,
                 marked: Default::default(),
             })
             .collect::<Box<_>>();
@@ -56,8 +60,9 @@ impl TextureCache {
             _tile_mem_alloc,
             _all_tiles_alloc,
             free_tiles,
-            hash_table: crossbeam_epoch::Atomic::new(TileHashTable::new(hash_size)),
-            free_hash_table: crossbeam_epoch::Atomic::new(TileHashTable::new(hash_size)),
+            rcu_collector: seize::Collector::new(),
+            hash_table: AtomicPtr::new(Box::into_raw(Box::new(TileHashTable::new(hash_size)))),
+            free_hash_table: AtomicPtr::new(Box::into_raw(Box::new(TileHashTable::new(hash_size)))),
             textures: Vec::new(),
             outstanding_reads: Mutex::new(Vec::new()),
             outstanding_reads_condvar: Condvar::new(),
@@ -93,8 +98,8 @@ impl TextureCache {
         // get texel pointer from cache and return value
         let (tile_x, tile_y) = tex.tile_index(x, y);
         let tile_id = TileId::new(tex_id, level, tile_x, tile_y);
-        let tile = self.get_tile(tile_id);
-        let texel_offset = tile.start + tex.texel_offset(x, y);
+        let tile_offset = self.get_tile(tile_id);
+        let texel_offset = tile_offset + tex.texel_offset(x, y);
         let texel = &self._tile_mem_alloc[texel_offset..texel_offset + tex.format.texel_bytes()];
         T::from_bytes(&texel[0..T::STRIDE])
     }
@@ -112,7 +117,7 @@ impl TextureCache {
             .expect("Invalid offset into tile");
         let buf = unsafe {
             std::slice::from_raw_parts_mut(
-                self._tile_mem_alloc.as_ptr().add(tile.texels.start) as *mut u8,
+                self._tile_mem_alloc.as_ptr().add(tile.offset) as *mut u8,
                 tile_bytes,
             )
         };
@@ -132,13 +137,14 @@ impl TextureCache {
     }
 
     // Returns a pointer to the start of the texels for the given texture tile.
-    fn get_tile(&self, tile_id: TileId) -> Range<usize> {
+    fn get_tile(&self, tile_id: TileId) -> usize {
         // return tile if it's present in the hash table
-        let guard = crossbeam_epoch::pin();
-        let table = unsafe { self.hash_table.load(Ordering::Acquire, &guard).deref() };
+        let rcu = self.rcu_collector.enter();
+        let table = unsafe { &*rcu.protect(&self.hash_table, Ordering::Acquire) };
         if let Some(bytes) = table.look_up(tile_id) {
-            return bytes.clone();
+            return bytes;
         }
+        drop(rcu);
         // check to see if another thread is already loading this tile
         let mut outstanding_reads = self.outstanding_reads.lock().unwrap();
         for read_tile_id in outstanding_reads.iter() {
@@ -148,28 +154,29 @@ impl TextureCache {
                     .outstanding_reads_condvar
                     .wait(outstanding_reads)
                     .unwrap();
-                std::mem::drop(outstanding_reads);
+                drop(outstanding_reads);
                 return self.get_tile(tile_id);
             }
         }
         // record that the current thread will read tile_id
         outstanding_reads.push(tile_id);
-        std::mem::drop(outstanding_reads);
+        drop(outstanding_reads);
         // load texture tile from disk
         let tile = self.get_free_tile();
         self.read_tile(tile_id, tile);
         // add tile to hash table and return texel pointer
-        let guard = crossbeam_epoch::pin();
-        let table = unsafe { self.hash_table.load(Ordering::Relaxed, &guard).deref() };
+        let rcu = self.rcu_collector.enter();
+        let table = unsafe { &*rcu.protect(&self.hash_table, Ordering::Relaxed) };
         table.insert(tile);
+        drop(rcu);
         // update outstanding_reads for read tile
         let mut outstanding_reads = self.outstanding_reads.lock().unwrap();
         if let Some(index) = outstanding_reads.iter().position(|x| *x == tile_id) {
             outstanding_reads.swap_remove(index);
         }
-        std::mem::drop(outstanding_reads);
+        drop(outstanding_reads);
         self.outstanding_reads_condvar.notify_all();
-        tile.texels.clone()
+        tile.offset
     }
 
     // Returns an available tile, freeing tiles if needed.
@@ -177,19 +184,19 @@ impl TextureCache {
         let mut free_tiles = self.free_tiles.lock().unwrap();
         if free_tiles.is_empty() {
             // copy unmarked tiles to free_hash_table
-            let guard = crossbeam_epoch::pin();
-            let hash_table = unsafe { self.hash_table.load(Ordering::Relaxed, &guard).deref_mut() };
-            let mut free_hash_table = self.free_hash_table.load(Ordering::Relaxed, &guard);
-            hash_table.copy_active(unsafe { free_hash_table.deref_mut() });
+            let guard = self.rcu_collector.enter();
+            let hash_table = unsafe { &mut *guard.protect(&self.hash_table, Ordering::Relaxed) };
+            let free_hash_table_ptr = guard.protect(&self.free_hash_table, Ordering::Relaxed);
+            let free_hash_table = unsafe { &*free_hash_table_ptr };
+            hash_table.copy_active(free_hash_table);
             // swap texture cache hash tables
-            free_hash_table = self
-                .hash_table
-                .swap(free_hash_table, Ordering::AcqRel, &guard);
-            self.free_hash_table
-                .store(free_hash_table, Ordering::Relaxed);
+            self.free_hash_table.store(
+                self.hash_table.swap(free_hash_table_ptr, Ordering::AcqRel),
+                Ordering::Relaxed,
+            );
             // TODO: ensure that no threads are accessing the old hash table
             // add inactive tiles in free_hash_table to free list
-            unsafe { free_hash_table.deref_mut() }.reclaim_uncopied(&mut free_tiles);
+            free_hash_table.reclaim_uncopied(&mut free_tiles);
             if free_tiles.len() < self.mark_free_capacity {
                 hash_table.mark_entries();
             }
@@ -197,8 +204,8 @@ impl TextureCache {
         assert!(!free_tiles.is_empty());
         // mark hash table entries if free-tile availability is low
         if free_tiles.len() == self.mark_free_capacity {
-            let guard = crossbeam_epoch::pin();
-            let hash_table = unsafe { self.hash_table.load(Ordering::Acquire, &guard).deref() };
+            let guard = self.rcu_collector.enter();
+            let hash_table = unsafe { &*guard.protect(&self.hash_table, Ordering::Acquire) };
             hash_table.mark_entries();
         }
         // return tile from free_tiles
@@ -209,6 +216,15 @@ impl TextureCache {
                 .cast_mut()
                 .as_mut()
                 .unwrap()
+        }
+    }
+}
+
+impl Drop for TextureCache {
+    fn drop(&mut self) {
+        unsafe {
+            drop(Box::from_raw(self.hash_table.load(Ordering::Relaxed)));
+            drop(Box::from_raw(self.free_hash_table.load(Ordering::Relaxed)));
         }
     }
 }

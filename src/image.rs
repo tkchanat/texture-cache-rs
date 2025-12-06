@@ -1,8 +1,5 @@
 use crate::texel::*;
-use std::{
-    io::{Read, Write},
-    os::unix::fs::FileExt,
-};
+use std::io::{Read, Seek, Write};
 
 const MAGIC_BYTES: [u8; 4] = [0x54, 0x49, 0x4C, 0x45]; // "TILE"
 
@@ -262,7 +259,8 @@ impl TiledImage {
             let Extent { width, height } = level_resolution[level];
             let offset = header.level_offset[level];
             let mut buf = vec![0u8; (width * height) as usize * pixel_format.texel_bytes()];
-            file.read_exact_at(&mut buf, offset)?;
+            file.seek(std::io::SeekFrom::Start(offset as u64))?;
+            file.read(&mut buf)?;
             in_memory_levels.push(buf.into_boxed_slice());
         }
         assert!(in_memory_levels.len() == mip_levels - first_in_memory_level as usize);
@@ -484,7 +482,7 @@ impl TiledImage {
     // pyramid levels that are stored in the file's header and were loaded,
     // this returns a pointer to it.
     pub fn get_texel(&self, x: u32, y: u32, level: u32) -> Option<&[u8]> {
-        if level < self.first_in_memory_level {
+        if level <= self.first_in_memory_level {
             return None;
         }
         let level_start = &self.in_memory_levels[(level - self.first_in_memory_level) as usize];
